@@ -1,0 +1,9 @@
+{
+  "token": "<clickup api token>",
+  "assignee": "<clickup assignee id>",
+  "lists": [
+    { "id": <clickup list id>, "label": "List 1" },
+    { "id": <clickup list id>, "label": "List 2" }
+  ],
+  "workspacesRoot": "/Users/path/to/your/workspaces"
+}
