@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ws-url-open — dispatcher for anny-ws:// URLs.
+#
+# Called by AnnyWsHandler.app (see install.sh) with the clicked
+# URL as $1. Security model: the URL carries structured data only, never a
+# command. Every action is explicitly listed here and validates its argument
+# before doing anything — any app on this machine can open anny-ws:// URLs,
+# so treat the input as untrusted.
+#
+#   anny-ws://ping/<anything>   sanity check, just echoes
+#   anny-ws://create/<slug>     ws create <slug>  (slug: CU-<taskid>_<kebab>)
+#   anny-ws://open/<slug>       open the workspace's .code-workspace in VS Code
+
+# The handler app invokes this with a minimal PATH; make sure `ws` and `code`
+# (homebrew symlink) are reachable.
+export PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+
+# workspacesRoot comes from config.json at the repo root (sed instead of a
+# JSON parser: node may not be on the handler's PATH, and the file is our own
+# flat config).
+CONFIG_FILE="$(cd "$(dirname "$0")/.." && pwd)/config.json"
+config_workspaces_root() {
+  sed -n 's/.*"workspacesRoot"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" 2>/dev/null | head -n1
+}
+
+url="${1:-}"
+[[ -n "$url" ]] || { echo "usage: ws-url-open <anny-ws://...>" >&2; exit 2; }
+[[ "$url" == anny-ws://* ]] || { echo "not an anny-ws:// URL: $url" >&2; exit 2; }
+
+rest="${url#anny-ws://}"
+rest="${rest%/}"
+action="${rest%%/*}"
+arg=""
+[[ "$rest" == */* ]] && arg="${rest#*/}"
+
+case "$action" in
+  ping)
+    echo "anny-ws URL handler OK (arg: ${arg:-<none>})"
+    ;;
+  create)
+    if [[ ! "$arg" =~ ^CU-[a-z0-9]+_[a-z0-9-]+$ ]]; then
+      echo "refusing to create workspace: invalid slug \"$arg\"" >&2
+      exit 1
+    fi
+    exec ws create "$arg"
+    ;;
+  open)
+    if [[ ! "$arg" =~ ^CU-[a-z0-9]+_[a-z0-9-]+$ ]]; then
+      echo "refusing to open workspace: invalid slug \"$arg\"" >&2
+      exit 1
+    fi
+    WORKSPACES_ROOT="$(config_workspaces_root)"
+    if [[ -z "$WORKSPACES_ROOT" ]]; then
+      echo "workspacesRoot not set in $CONFIG_FILE" >&2
+      exit 1
+    fi
+    # Workspace file lives in the workspace dir (current layout) or the
+    # projects root (legacy) — same fallback `ws` itself uses.
+    for f in "$WORKSPACES_ROOT/$arg/$arg.code-workspace" "$(dirname "$WORKSPACES_ROOT")/$arg.code-workspace"; do
+      if [[ -f "$f" ]]; then
+        if command -v code >/dev/null; then
+          exec code "$f"
+        else
+          exec /usr/bin/open -a "Visual Studio Code" "$f"
+        fi
+      fi
+    done
+    echo "no .code-workspace file found for \"$arg\"" >&2
+    exit 1
+    ;;
+  *)
+    echo "unknown action: \"$action\" (url: $url)" >&2
+    exit 1
+    ;;
+esac

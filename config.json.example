@@ -1,9 +1,24 @@
 {
   "token": "<clickup api token>",
-  "assignee": "<clickup assignee id>",
+  "assignee": "<clickup user id>",
   "lists": [
-    { "id": <clickup list id>, "label": "List 1" },
-    { "id": <clickup list id>, "label": "List 2" }
+    { "id": "<clickup list id>", "label": "List 1" },
+    { "id": "<clickup list id>", "label": "List 2" }
   ],
-  "workspacesRoot": "/Users/path/to/your/workspaces"
+  "workspacesRoot": "/Users/path/to/your/workspaces",
+  "statusGroups": [
+    {
+      "key": "ongoing",
+      "title": "Ongoing",
+      "statuses": [
+        { "name": "in progress", "color": "green" },
+        { "name": "testing", "color": "yellow" }
+      ]
+    },
+    {
+      "key": "open",
+      "title": "Open",
+      "statuses": [{ "name": "to do" }]
+    }
+  ]
 }

@@ -1,0 +1,454 @@
+#!/usr/bin/env node
+// tasks — ClickUp task list CLI, joined with local `ws` dev workspaces.
+// Subcommands: list (default)
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// Everything workspace/user-specific (assignee, lists, status groups,
+// workspacesRoot) lives in config.json at the repo root — see
+// config.json.example and loadConfig().
+const CONFIG_FILE = path.join(__dirname, '..', 'config.json');
+const STATE_FILE = path.join(os.homedir(), '.cache', 'anny-tasks', 'last-list.json');
+const API_BASE = 'https://api.clickup.com/api/v2';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const isTTY = process.stdout.isTTY;
+const ansi = (code) => (s) => (isTTY ? `\x1b[${code}m${s}\x1b[0m` : s);
+const red = ansi(31);
+const green = ansi(32);
+const yellow = ansi(33);
+const blue = ansi(34);
+const magenta = ansi(35);
+const cyan = ansi(36);
+const dim = ansi(2);
+const bold = ansi(1);
+
+// Color names usable in config.json statusGroups.
+const COLOR_FNS = { red, green, yellow, blue, magenta, cyan, dim };
+
+// Truecolor foreground from a "#rrggbb" hex (workspace accent colors).
+function rgb(hex) {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m || !isTTY) return (s) => s;
+  const n = parseInt(m[1], 16);
+  return ansi(`38;2;${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}`);
+}
+
+// OSC 8 terminal hyperlink (same mechanism `ws list` uses for serve URLs).
+const link = (text, url) => (isTTY && url ? `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\` : text);
+
+// Spinner on stderr while fetching (TTY only; piped output stays clean).
+// Returns a stop function; also tracked module-wide so fail() can clean up.
+let activeSpinnerStop = null;
+function startSpinner(text) {
+  if (!process.stderr.isTTY) return () => {};
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  process.stderr.write('\x1b[?25l'); // hide cursor
+  const draw = () => process.stderr.write(`\r\x1b[2m${frames[i++ % frames.length]} ${text}\x1b[0m`);
+  draw();
+  const timer = setInterval(draw, 80);
+  const stop = () => {
+    clearInterval(timer);
+    process.stderr.write('\r\x1b[2K\x1b[?25h'); // clear line, restore cursor
+    activeSpinnerStop = null;
+  };
+  activeSpinnerStop = stop;
+  return stop;
+}
+
+function fail(msg, code = 1) {
+  if (activeSpinnerStop) activeSpinnerStop();
+  process.stderr.write(msg + '\n');
+  process.exit(code);
+}
+
+// Display width in code points (good enough for umlauts & latin text).
+function width(s) {
+  return [...s].length;
+}
+
+function truncate(s, max) {
+  const chars = [...s];
+  if (chars.length <= max) return s;
+  return chars.slice(0, Math.max(0, max - 1)).join('') + '…';
+}
+
+// ---------------------------------------------------------------------------
+// Token
+// ---------------------------------------------------------------------------
+
+function loadConfig() {
+  let file = {};
+  try {
+    file = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') fail(`tasks: could not read ${CONFIG_FILE}: ${err.message}`);
+  }
+
+  const token = (process.env.CLICKUP_API_TOKEN || (file.token != null ? String(file.token) : '')).trim();
+  if (!token) {
+    fail(
+      [
+        'No ClickUp API token found.',
+        '',
+        'Provide a personal API token (starts with pk_) via either:',
+        '  • env var:  export CLICKUP_API_TOKEN=pk_...',
+        `  • config:   ${CONFIG_FILE}  — {"token": "pk_..."}`,
+        '',
+        'Get one in ClickUp: avatar → Settings → Apps → API Token.',
+      ].join('\n')
+    );
+  }
+
+  const assignee = String(file.assignee != null ? file.assignee : '').trim();
+  const lists = Array.isArray(file.lists) ? file.lists : [];
+  const workspacesRoot = String(file.workspacesRoot || '').trim();
+  const rawGroups = Array.isArray(file.statusGroups) ? file.statusGroups : [];
+
+  const problems = [];
+  if (!/^\d+$/.test(assignee)) {
+    problems.push('"assignee": your numeric ClickUp user ID (avatar → Settings, or GET /api/v2/user)');
+  }
+  if (lists.length === 0 || !lists.every((l) => l && /^\d+$/.test(String(l.id)) && String(l.label || '').trim())) {
+    problems.push('"lists": non-empty array of { "id": "<numeric ClickUp list id>", "label": "<display name>" }');
+  }
+  if (!path.isAbsolute(workspacesRoot)) {
+    problems.push('"workspacesRoot": absolute path to the dev workspaces dir (contains <slug>/<slug>.code-workspace)');
+  }
+  const groupsOk =
+    rawGroups.length > 0 &&
+    rawGroups.every(
+      (g) =>
+        g &&
+        String(g.key || '').trim() &&
+        String(g.title || '').trim() &&
+        Array.isArray(g.statuses) &&
+        g.statuses.length > 0 &&
+        g.statuses.every((s) => s && String(s.name || '').trim() && (s.color == null || COLOR_FNS[s.color]))
+    );
+  if (!groupsOk) {
+    problems.push(
+      `"statusGroups": non-empty array of { "key", "title", "statuses": [{ "name", "color"? }] } — display order; colors: ${Object.keys(COLOR_FNS).join(', ')}`
+    );
+  }
+  if (problems.length > 0) {
+    fail(
+      [`Missing or invalid keys in ${CONFIG_FILE}:`, '', ...problems.map((p) => '  • ' + p), '', 'See config.json.example.'].join('\n')
+    );
+  }
+
+  const statusGroups = rawGroups.map((g) => ({
+    key: String(g.key).trim(),
+    title: String(g.title).trim(),
+    statuses: g.statuses.map((s) => String(s.name).trim().toLowerCase()),
+  }));
+  const statusColor = {};
+  for (const g of rawGroups) {
+    for (const s of g.statuses) {
+      if (s.color) statusColor[String(s.name).trim().toLowerCase()] = COLOR_FNS[s.color];
+    }
+  }
+
+  return {
+    token,
+    assignee,
+    lists: lists.map((l) => ({ id: String(l.id), label: String(l.label).trim() })),
+    workspacesRoot,
+    statusGroups,
+    statusColor,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ClickUp fetch
+// ---------------------------------------------------------------------------
+
+async function fetchListTasks(token, assignee, statuses, list) {
+  const tasks = [];
+  for (let page = 0; ; page++) {
+    const params = new URLSearchParams();
+    params.append('assignees[]', assignee);
+    for (const s of statuses) params.append('statuses[]', s);
+    params.append('include_closed', 'false');
+    params.append('page', String(page));
+
+    const url = `${API_BASE}/list/${list.id}/task?${params}`;
+    const res = await fetch(url, { headers: { Authorization: token } });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      fail(`ClickUp API error for list ${list.label} (${list.id}): HTTP ${res.status}\n${body}`);
+    }
+    const data = await res.json();
+    for (const t of data.tasks || []) {
+      tasks.push({
+        id: t.id,
+        name: t.name,
+        url: t.url,
+        status: (t.status && t.status.status) || '',
+        priority: (t.priority && t.priority.priority) || null,
+        list: list.label,
+        date_updated: Number(t.date_updated) || 0,
+      });
+    }
+    if (data.last_page !== false) break; // last_page true or absent → stop
+  }
+  return tasks;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace join
+// ---------------------------------------------------------------------------
+
+// A workspace's accent color, the same one `ws list` shows as a colored dot:
+// titleBar.activeBackground from the workspace's .code-workspace file. Older
+// workspaces keep that file in the projects root instead of the session dir
+// (same fallback `ws` itself uses).
+function workspaceAccentColor(workspacesRoot, name) {
+  const candidates = [
+    path.join(workspacesRoot, name, `${name}.code-workspace`),
+    path.join(path.dirname(workspacesRoot), `${name}.code-workspace`),
+  ];
+  for (const file of candidates) {
+    try {
+      const m = fs.readFileSync(file, 'utf8').match(/"titleBar\.activeBackground"\s*:\s*"(#[0-9a-fA-F]{6})"/);
+      if (m) return m[1];
+    } catch {}
+  }
+  return null;
+}
+
+function getWorkspaces(workspacesRoot) {
+  // Returns { ok, workspaces: [{ name, taskId, color }] }
+  try {
+    const out = execFileSync('ws', ['list'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const workspaces = [];
+    for (const line of out.split('\n')) {
+      const m = line.match(/\b(CU-([a-z0-9]+)_\S+)/);
+      if (m) workspaces.push({ name: m[1], taskId: m[2], color: workspaceAccentColor(workspacesRoot, m[1]) });
+    }
+    return { ok: true, workspaces };
+  } catch {
+    return { ok: false, workspaces: [] };
+  }
+}
+
+// Workspace slug for a task: CU-<taskId>_<short-kebab-name> (the `ws create`
+// convention). Kebab part: first 4 words of the task name, accents folded.
+function deriveSlug(t) {
+  const words = t.name
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 4);
+  const short = (words.join('-') || 'task').slice(0, 40).replace(/-+$/, '');
+  return `CU-${t.id.toLowerCase()}_${short}`;
+}
+
+// ---------------------------------------------------------------------------
+// list command
+// ---------------------------------------------------------------------------
+
+async function cmdList() {
+  const { token, assignee, lists, workspacesRoot, statusGroups, statusColor } = loadConfig();
+  const statuses = statusGroups.flatMap((g) => g.statuses);
+
+  const stopSpinner = startSpinner('Fetching ClickUp tasks…');
+  let all, ws;
+  try {
+    const perList = await Promise.all(lists.map((l) => fetchListTasks(token, assignee, statuses, l)));
+    all = perList.flat();
+    ws = getWorkspaces(workspacesRoot);
+  } finally {
+    stopSpinner();
+  }
+  const wsByTaskId = new Map(ws.workspaces.map((w) => [w.taskId, w]));
+
+  // Group tasks
+  const statusToGroup = new Map();
+  for (const g of statusGroups) for (const s of g.statuses) statusToGroup.set(s, g.key);
+
+  const grouped = new Map(statusGroups.map((g) => [g.key, []]));
+  const other = [];
+  for (const t of all) {
+    const key = statusToGroup.get(t.status.toLowerCase());
+    if (key) grouped.get(key).push(t);
+    else other.push(t);
+  }
+  for (const arr of grouped.values()) arr.sort((a, b) => b.date_updated - a.date_updated);
+  other.sort((a, b) => b.date_updated - a.date_updated);
+
+  const groupsToPrint = statusGroups.map((g) => ({ ...g, tasks: grouped.get(g.key) })).filter((g) => g.tasks.length > 0);
+  if (other.length > 0) groupsToPrint.push({ key: 'other', title: 'Other', statuses: [], tasks: other });
+
+  // Build rows with continuous index
+  let index = 0;
+  const stateRows = [];
+  const matchedTaskIds = new Set();
+  const sections = [];
+
+  for (const g of groupsToPrint) {
+    const rows = [];
+    for (const t of g.tasks) {
+      index++;
+      const w = wsByTaskId.get(t.id.toLowerCase());
+      if (w) matchedTaskIds.add(w.taskId);
+      const prio = t.priority === 'high' ? 'HIGH' : t.priority || '';
+      const slug = deriveSlug(t);
+      rows.push({
+        index,
+        name: t.name,
+        prio,
+        status: t.status,
+        list: t.list,
+        // No workspace yet → clickable button (anny-ws:// handler runs
+        // `ws create <slug>`); only useful on a terminal.
+        workspace: w ? `● ${w.name}` : isTTY ? '⊕ create workspace' : '–',
+        createUrl: w ? null : `anny-ws://create/${slug}`,
+        openUrl: w ? `anny-ws://open/${w.name}` : null,
+        wsColor: w ? w.color : null,
+        url: t.url,
+      });
+      stateRows.push({
+        index,
+        id: t.id,
+        name: t.name,
+        url: t.url,
+        status: t.status,
+        group: g.key,
+        list: t.list,
+        workspace: w ? w.name : null,
+        slug,
+      });
+    }
+    sections.push({ title: g.title, rows });
+  }
+
+  // Render tables. On a terminal the task name doubles as a hyperlink (like
+  // `ws list` serve URLs), so the URL column only appears in piped output.
+  const header = { index: '#', name: 'Task', prio: 'Prio', status: 'Status', list: 'List', workspace: 'Workspace', url: 'URL' };
+  const cols = isTTY
+    ? ['index', 'name', 'prio', 'status', 'list', 'workspace']
+    : ['index', 'name', 'prio', 'status', 'list', 'workspace', 'url'];
+  const allRows = sections.flatMap((s) => s.rows);
+
+  const colWidth = {};
+  for (const c of cols) {
+    colWidth[c] = Math.max(width(header[c]), ...allRows.map((r) => width(String(r[c]))), 0);
+  }
+
+  // Truncate task names if lines would exceed terminal width.
+  // Each column renders as `│ value ` (3 chars overhead) plus the closing `│`.
+  const termWidth = process.stdout.columns || 160;
+  const fixed = cols.filter((c) => c !== 'name').reduce((sum, c) => sum + colWidth[c] + 3, 0) + 4;
+  const nameMax = Math.max(12, termWidth - fixed);
+  if (colWidth.name > nameMax) {
+    colWidth.name = nameMax;
+    for (const r of allRows) r.name = truncate(r.name, nameMax);
+  }
+
+  const border = (l, m, r) => dim(l + cols.map((c) => '─'.repeat(colWidth[c] + 2)).join(m) + r);
+  const V = dim('│');
+
+  const renderCell = (r, c, isHeader) => {
+    const raw = truncate(String(r[c]), colWidth[c]);
+    const padding = ' '.repeat(Math.max(0, colWidth[c] - width(raw)));
+    if (isHeader) return dim(raw) + padding;
+    switch (c) {
+      case 'index':
+        return dim(raw) + padding;
+      case 'name':
+        return link(raw, r.url) + padding;
+      case 'prio':
+        if (raw === 'HIGH' || raw === 'urgent') return bold(red(raw)) + padding;
+        return dim(raw) + padding;
+      case 'status': {
+        const color = statusColor[String(r.status).toLowerCase()];
+        return (color ? color(raw) : raw) + padding;
+      }
+      case 'workspace':
+        if (r.createUrl) return link(cyan(raw), r.createUrl) + padding;
+        if (raw === '–') return dim(raw) + padding;
+        return link(r.wsColor ? raw.replace('●', rgb(r.wsColor)('●')) : raw, r.openUrl) + padding;
+      case 'url':
+        return green(link(raw, r.url)) + padding;
+      default:
+        return raw + padding;
+    }
+  };
+
+  const renderRow = (r, isHeader = false) =>
+    `${V} ` + cols.map((c) => renderCell(r, c, isHeader)).join(` ${V} `) + ` ${V}`;
+
+  const out = [];
+  for (const s of sections) {
+    out.push(`${bold(s.title)} ${dim(`(${s.rows.length})`)}`);
+    out.push(border('╭', '┬', '╮'));
+    out.push(renderRow(header, true));
+    out.push(border('├', '┼', '┤'));
+    for (const r of s.rows) out.push(renderRow(r));
+    out.push(border('╰', '┴', '╯'));
+    out.push('');
+  }
+
+  if (sections.length === 0) out.push('No tasks found in the tracked statuses.', '');
+
+  // Warnings
+  if (!ws.ok) {
+    out.push(dim('ℹ `ws` CLI not available or failed — workspace column omitted.'));
+  } else {
+    for (const w of ws.workspaces) {
+      if (!matchedTaskIds.has(w.taskId)) {
+        out.push(yellow(`⚠ workspace ${w.name} has no matching task in the tracked statuses`));
+      }
+    }
+  }
+  if (other.length > 0) {
+    out.push(dim(`ℹ ${other.length} task(s) had a status outside the known groups — shown under "Other".`));
+  }
+
+  process.stdout.write(out.join('\n').trimEnd() + '\n');
+
+  // State file
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify({ generated_at: new Date().toISOString(), rows: stateRows }, null, 2) + '\n');
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+const USAGE = `Usage: tasks [command]
+
+Commands:
+  list    Show my ClickUp tasks grouped by status (default)
+`;
+
+async function main() {
+  const cmd = process.argv[2] || 'list';
+  if (cmd === 'list') return cmdList();
+  if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    process.stdout.write(USAGE);
+    return;
+  }
+  process.stderr.write(`tasks: unknown command "${cmd}"\n\n${USAGE}`);
+  process.exit(2);
+}
+
+main().catch((err) => fail(`tasks: ${err.message || err}`));

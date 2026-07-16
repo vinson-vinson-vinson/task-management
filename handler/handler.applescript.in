@@ -1,0 +1,23 @@
+-- Source for AnnyWsHandler.app — receives anny-ws:// URLs and runs the
+-- ws-url-open dispatcher in a visible Terminal window (so `ws create`
+-- progress is visible). @DISPATCHER@ is substituted by install.sh.
+-- Rebuild with: ./install.sh  (do not edit the .app directly)
+--
+-- Controlling Terminal needs a one-time Automation consent (System Settings
+-- → Privacy & Security → Automation → AnnyWsHandler → Terminal). If it was
+-- silently denied: tccutil reset AppleEvents co.anny.ws-url-handler
+on open location theURL
+	try
+		if theURL starts with "anny-ws://open/" then
+			-- fast, windowless action (launches VS Code) — no Terminal needed
+			do shell script "@DISPATCHER@ " & quoted form of theURL
+		else
+			tell application "Terminal"
+				activate
+				do script "@DISPATCHER@ " & quoted form of theURL
+			end tell
+		end if
+	on error errMsg number errNum
+		display dialog "anny-ws handler failed (" & errNum & "): " & errMsg & return & return & "If this is a permissions error (-1743), allow AnnyWsHandler → Terminal under System Settings → Privacy & Security → Automation." buttons {"OK"} default button 1 with icon stop
+	end try
+end open location
